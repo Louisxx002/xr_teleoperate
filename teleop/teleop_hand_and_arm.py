@@ -8,6 +8,7 @@ logger_mp = logging_mp.getLogger(__name__)
 
 import os 
 import sys
+import numpy as np
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
@@ -69,6 +70,72 @@ def get_state() -> dict:
         "READY": READY,
         "RECORD_RUNNING": RECORD_RUNNING,
     }
+
+def _debug_pose_xyz(pose):
+    if pose is None:
+        return None
+    try:
+        pose_array = np.asarray(pose)
+        if pose_array.ndim >= 2 and pose_array.shape[0] >= 3 and pose_array.shape[1] >= 4:
+            return np.round(pose_array[:3, 3], 4).tolist()
+    except Exception as e:
+        return f"ERROR: {repr(e)}"
+    return None
+
+def _debug_ctrl_state(tele_data, side):
+    if tele_data is None:
+        return None
+    return {
+        "trigger": getattr(tele_data, f"{side}_ctrl_trigger", None),
+        "triggerValue": getattr(tele_data, f"{side}_ctrl_triggerValue", None),
+        "grip": getattr(tele_data, f"{side}_ctrl_squeeze", None),
+        "gripValue": getattr(tele_data, f"{side}_ctrl_squeezeValue", None),
+        "thumbstick": getattr(tele_data, f"{side}_ctrl_thumbstick", None),
+        "thumbstickValue": np.round(np.asarray(getattr(tele_data, f"{side}_ctrl_thumbstickValue", [])), 4).tolist(),
+    }
+
+def _debug_max_abs_delta(sol_q, current_q):
+    try:
+        return float(np.max(np.abs(np.asarray(sol_q) - np.asarray(current_q))))
+    except Exception as e:
+        return f"ERROR: {repr(e)}"
+
+def _controller_hand_amounts(tele_data, side):
+    trigger_value = getattr(tele_data, f"{side}_ctrl_triggerValue", 10.0)
+    grip_value = getattr(tele_data, f"{side}_ctrl_squeezeValue", 0.0)
+    trigger_amount = np.clip((10.0 - float(trigger_value)) / 10.0, 0.0, 1.0)
+    grip_amount = np.clip(float(grip_value), 0.0, 1.0)
+    if getattr(tele_data, f"{side}_ctrl_trigger", False) and trigger_amount == 0.0:
+        trigger_amount = 0.2
+    if getattr(tele_data, f"{side}_ctrl_squeeze", False) and grip_amount == 0.0:
+        grip_amount = 0.2
+    return trigger_amount, grip_amount
+
+def _update_controller_hand_array(tele_data, controller_hand_array):
+    left_trigger_amount, left_grip_amount = _controller_hand_amounts(tele_data, "left")
+    right_trigger_amount, right_grip_amount = _controller_hand_amounts(tele_data, "right")
+    values = [
+        left_trigger_amount,
+        left_grip_amount,
+        right_trigger_amount,
+        right_grip_amount,
+    ]
+    with controller_hand_array.get_lock():
+        controller_hand_array[:] = values
+    return values
+
+def _debug_controller_hand_input(tele_data, controller_hand_values):
+    return (
+        f"left_raw={{'trigger': {getattr(tele_data, 'left_ctrl_trigger', None)}, "
+        f"'triggerValue': {getattr(tele_data, 'left_ctrl_triggerValue', None)}, "
+        f"'grip': {getattr(tele_data, 'left_ctrl_squeeze', None)}, "
+        f"'gripValue': {getattr(tele_data, 'left_ctrl_squeezeValue', None)}}} "
+        f"right_raw={{'trigger': {getattr(tele_data, 'right_ctrl_trigger', None)}, "
+        f"'triggerValue': {getattr(tele_data, 'right_ctrl_triggerValue', None)}, "
+        f"'grip': {getattr(tele_data, 'right_ctrl_squeeze', None)}, "
+        f"'gripValue': {getattr(tele_data, 'right_ctrl_squeezeValue', None)}}} "
+        f"controller_hand_array={np.round(np.asarray(controller_hand_values), 4).tolist()}"
+    )
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -199,7 +266,11 @@ if __name__ == '__main__':
             dual_hand_data_lock = Lock()
             dual_hand_state_array = Array('d', 12, lock = False)   # [output] current left, right hand state(12) data.
             dual_hand_action_array = Array('d', 12, lock = False)  # [output] current left, right hand action(12) data.
-            hand_ctrl = Inspire_Controller_FTP(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
+            controller_hand_array = Array('d', 4, lock=True) if args.input_mode == "controller" else None
+            hand_ctrl = Inspire_Controller_FTP(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock,
+                                               dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim,
+                                               xr_motion_data_ready_in=xr_motion_data_ready,
+                                               controller_hand_array=controller_hand_array)
         elif args.ee == "brainco" and args.input_mode == "hand":
             from teleop.robot_control.robot_hand_brainco import Brainco_Controller_hand
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]
@@ -267,15 +338,27 @@ if __name__ == '__main__':
         logger_mp.info("🔴  Press [q] to stop and exit the program.")
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
         READY = True                  # now ready to (1) enter START state
+        last_prestart_hand_debug_log_time = 0.0
         while not START and not STOP: # wait for start or stop signal.
+            wait_loop_time = time.time()
             time.sleep(0.033)
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img = img_client.get_head_frame()
                 if head_img.bgr is not None:
                     tv_wrapper.render_to_xr(head_img.bgr)
+            if args.ee == "inspire_ftp" and args.input_mode == "controller":
+                tele_data = tv_wrapper.get_tele_data()
+                controller_hand_values = _update_controller_hand_array(tele_data, controller_hand_array)
+                if wait_loop_time - last_prestart_hand_debug_log_time >= 1.0:
+                    logger_mp.info(
+                        "[DEBUG_INSPIRE_INPUT pre_start] "
+                        + _debug_controller_hand_input(tele_data, controller_hand_values)
+                    )
+                    last_prestart_hand_debug_log_time = wait_loop_time
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         arm_ctrl.speed_gradual_max()
+        last_debug_log_time = 0.0
 
         head_img = None
         left_wrist_img = None
@@ -313,7 +396,10 @@ if __name__ == '__main__':
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
-            if args.ee in ("dex3", "inspire_ftp", "inspire_dfx", "brainco")  and args.input_mode == "hand":
+            debug_log_due = start_time - last_debug_log_time >= 1.0
+            if debug_log_due and tele_data is None:
+                logger_mp.info("[DEBUG_TELEOP] tracking=True tele_data_is_none=True")
+            if args.ee in ("dex3", "inspire_ftp", "inspire_dfx", "brainco") and args.input_mode == "hand":
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
                 with right_hand_pos_array.get_lock():
@@ -332,6 +418,13 @@ if __name__ == '__main__':
                     left_gripper_value.value = tele_data.left_ctrl_triggerValue
                 with right_gripper_value.get_lock():
                     right_gripper_value.value = tele_data.right_ctrl_triggerValue
+            elif args.ee == "inspire_ftp" and args.input_mode == "controller":
+                controller_hand_values = _update_controller_hand_array(tele_data, controller_hand_array)
+                if debug_log_due:
+                    logger_mp.info(
+                        "[DEBUG_INSPIRE_INPUT tracking] "
+                        + _debug_controller_hand_input(tele_data, controller_hand_values)
+                    )
             elif args.ee == "dex1" and args.input_mode == "hand":
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_hand_pinchValue
@@ -365,6 +458,22 @@ if __name__ == '__main__':
             sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
+            if debug_log_due:
+                logger_mp.info(
+                    "[DEBUG_TELEOP] "
+                    f"tracking={START and not STOP} "
+                    f"tele_data_is_none={tele_data is None} "
+                    f"head_pose_is_none={getattr(tele_data, 'head_pose', None) is None} "
+                    f"left_wrist_pose_is_none={getattr(tele_data, 'left_wrist_pose', None) is None} "
+                    f"right_wrist_pose_is_none={getattr(tele_data, 'right_wrist_pose', None) is None} "
+                    f"left_wrist_xyz={_debug_pose_xyz(getattr(tele_data, 'left_wrist_pose', None))} "
+                    f"right_wrist_xyz={_debug_pose_xyz(getattr(tele_data, 'right_wrist_pose', None))} "
+                    f"left_ctrl={_debug_ctrl_state(tele_data, 'left')} "
+                    f"right_ctrl={_debug_ctrl_state(tele_data, 'right')} "
+                    f"arm_q_read_ok={current_lr_arm_q is not None} "
+                    f"ik_max_abs_delta={_debug_max_abs_delta(sol_q, current_lr_arm_q)}"
+                )
+                last_debug_log_time = start_time
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
 
             # record data

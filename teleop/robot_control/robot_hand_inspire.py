@@ -162,13 +162,18 @@ kTopicInspireFTPLeftCommand   = "rt/inspire_hand/ctrl/l"
 kTopicInspireFTPRightCommand  = "rt/inspire_hand/ctrl/r"
 kTopicInspireFTPLeftState  = "rt/inspire_hand/state/l"
 kTopicInspireFTPRightState = "rt/inspire_hand/state/r"
+Inspire_FTP_Controller_Open_Cmd = 800
+Inspire_FTP_Controller_Close_Cmd = 200
+Inspire_FTP_Controller_Smooth_Alpha = 0.08
 
 class Inspire_Controller_FTP:
     def __init__(self, left_hand_array, right_hand_array, dual_hand_data_lock = None, dual_hand_state_array = None,
-                       dual_hand_action_array = None, fps = 100.0, Unit_Test = False, simulation_mode = False, xr_motion_data_ready_in = None):
+                       dual_hand_action_array = None, fps = 100.0, Unit_Test = False, simulation_mode = False,
+                       xr_motion_data_ready_in = None, controller_hand_array = None):
         logger_mp.info("Initialize Inspire_Controller_FTP...")
         from inspire_sdkpy import inspire_dds  # lazy import
         import inspire_sdkpy.inspire_hand_defaut as inspire_hand_default
+        self.inspire_hand_default = inspire_hand_default
         self.fps = fps
         self.Unit_Test = Unit_Test
         self.simulation_mode = simulation_mode
@@ -193,6 +198,7 @@ class Inspire_Controller_FTP:
         # Shared Arrays for hand states ([0,1] normalized values)
         self.left_hand_state_array  = Array('d', Inspire_Num_Motors, lock=True)
         self.right_hand_state_array = Array('d', Inspire_Num_Motors, lock=True)
+        self.hand_state_received_array = Array('b', 2, lock=True)
 
         # Initialize subscribe thread
         self.subscribe_state_thread = threading.Thread(target=self._subscribe_hand_state)
@@ -212,7 +218,8 @@ class Inspire_Controller_FTP:
         logger_mp.info("[Inspire_Controller_FTP] Initial hand states received or timeout.")
 
         hand_control_process = Process(target=self.control_process, args=(left_hand_array, right_hand_array, self.left_hand_state_array, self.right_hand_state_array,
-                                                                          dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, xr_motion_data_ready_in))
+                                                                          dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, controller_hand_array,
+                                                                          self.hand_state_received_array, xr_motion_data_ready_in))
         hand_control_process.daemon = True
         hand_control_process.start()
 
@@ -224,6 +231,8 @@ class Inspire_Controller_FTP:
             # Left Hand
             left_state_msg = self.LeftHandState_subscriber.Read()
             if left_state_msg is not None:
+                with self.hand_state_received_array.get_lock():
+                    self.hand_state_received_array[0] = True
                 if hasattr(left_state_msg, 'angle_act') and len(left_state_msg.angle_act) == Inspire_Num_Motors:
                     with self.left_hand_state_array.get_lock():
                         for i in range(Inspire_Num_Motors):
@@ -233,6 +242,8 @@ class Inspire_Controller_FTP:
             # Right Hand
             right_state_msg = self.RightHandState_subscriber.Read()
             if right_state_msg is not None:
+                with self.hand_state_received_array.get_lock():
+                    self.hand_state_received_array[1] = True
                 if hasattr(right_state_msg, 'angle_act') and len(right_state_msg.angle_act) == Inspire_Num_Motors:
                     with self.right_hand_state_array.get_lock():
                         for i in range(Inspire_Num_Motors):
@@ -247,32 +258,37 @@ class Inspire_Controller_FTP:
         Send scaled angle commands [0-1000] to both hands.
         """
         # Left Hand Command
-        left_cmd_msg = inspire_hand_default.get_inspire_hand_ctrl()
+        left_cmd_msg = self.inspire_hand_default.get_inspire_hand_ctrl()
         left_cmd_msg.angle_set = left_angle_cmd_scaled
         left_cmd_msg.mode = 0b0001 # Mode 1: Angle control
-        self.LeftHandCmd_publisher.Write(left_cmd_msg)
+        left_publish_ok = self.LeftHandCmd_publisher.Write(left_cmd_msg)
 
         # Right Hand Command
-        right_cmd_msg = inspire_hand_default.get_inspire_hand_ctrl()
+        right_cmd_msg = self.inspire_hand_default.get_inspire_hand_ctrl()
         right_cmd_msg.angle_set = right_angle_cmd_scaled
         right_cmd_msg.mode = 0b0001 # Mode 1: Angle control
-        self.RightHandCmd_publisher.Write(right_cmd_msg)
+        right_publish_ok = self.RightHandCmd_publisher.Write(right_cmd_msg)
 
-        # 临时打开前 N 次的 log
-        if not hasattr(self, "_debug_count"):
-            self._debug_count = 0
-        if self._debug_count < 50:
-            logger_mp.info(f"[Inspire_Controller_FTP] Publish cmd L={left_angle_cmd_scaled} R={right_angle_cmd_scaled} ")
-            self._debug_count += 1
-
+        return {
+            "left": left_publish_ok,
+            "right": right_publish_ok,
+            "left_topic": kTopicInspireFTPLeftCommand,
+            "right_topic": kTopicInspireFTPRightCommand,
+        }
 
     def control_process(self, left_hand_array, right_hand_array, left_hand_state_array, right_hand_state_array,
-                              dual_hand_data_lock = None, dual_hand_state_array = None, dual_hand_action_array = None, xr_motion_data_ready_in = None):
+                              dual_hand_data_lock = None, dual_hand_state_array = None, dual_hand_action_array = None,
+                              controller_hand_array = None, hand_state_received_array = None, xr_motion_data_ready_in = None):
         logger_mp.info("[Inspire_Controller_FTP] Control process started.")
         self.running = True
 
         left_q_target  = np.full(Inspire_Num_Motors, 1.0)
         right_q_target = np.full(Inspire_Num_Motors, 1.0)
+        left_cmd_target = np.full(Inspire_Num_Motors, Inspire_FTP_Controller_Open_Cmd, dtype=float)
+        right_cmd_target = np.full(Inspire_Num_Motors, Inspire_FTP_Controller_Open_Cmd, dtype=float)
+        left_cmd_smoothed = left_cmd_target.copy()
+        right_cmd_smoothed = right_cmd_target.copy()
+        last_debug_log_time = 0.0
 
         try:
             while self.running:
@@ -312,8 +328,37 @@ class Inspire_Controller_FTP:
                             left_q_target[idx]  = normalize(left_q_target[idx], -0.1, 1.3)
                             right_q_target[idx] = normalize(right_q_target[idx], -0.1, 1.3)
 
-                scaled_left_cmd = [int(np.clip(val * 1000, 0, 1000)) for val in left_q_target]
-                scaled_right_cmd = [int(np.clip(val * 1000, 0, 1000)) for val in right_q_target]
+                controller_debug = None
+                left_close = None
+                right_close = None
+                if controller_hand_array is not None:
+                    with controller_hand_array.get_lock():
+                        controller_data = np.array(controller_hand_array[:], dtype=float)
+                    left_close = float(np.clip(max(controller_data[0], controller_data[1]), 0.0, 1.0))
+                    right_close = float(np.clip(max(controller_data[2], controller_data[3]), 0.0, 1.0))
+                    safe_range = Inspire_FTP_Controller_Open_Cmd - Inspire_FTP_Controller_Close_Cmd
+                    left_base_target = Inspire_FTP_Controller_Open_Cmd - left_close * safe_range
+                    right_base_target = Inspire_FTP_Controller_Open_Cmd - right_close * safe_range
+                    left_cmd_target = np.full(Inspire_Num_Motors, left_base_target, dtype=float)
+                    right_cmd_target = np.full(Inspire_Num_Motors, right_base_target, dtype=float)
+                    # Match the official dds_publish.py pattern: channels 4 and 5 are inverted.
+                    left_cmd_target[-2:] = 1000 - left_cmd_target[-2:]
+                    right_cmd_target[-2:] = 1000 - right_cmd_target[-2:]
+                    left_cmd_target = np.clip(left_cmd_target, Inspire_FTP_Controller_Close_Cmd, Inspire_FTP_Controller_Open_Cmd)
+                    right_cmd_target = np.clip(right_cmd_target, Inspire_FTP_Controller_Close_Cmd, Inspire_FTP_Controller_Open_Cmd)
+                    left_cmd_smoothed = (1.0 - Inspire_FTP_Controller_Smooth_Alpha) * left_cmd_smoothed + Inspire_FTP_Controller_Smooth_Alpha * left_cmd_target
+                    right_cmd_smoothed = (1.0 - Inspire_FTP_Controller_Smooth_Alpha) * right_cmd_smoothed + Inspire_FTP_Controller_Smooth_Alpha * right_cmd_target
+                    left_q_target = left_cmd_smoothed / 1000.0
+                    right_q_target = right_cmd_smoothed / 1000.0
+                    controller_debug = {
+                        "left_trigger": round(float(controller_data[0]), 4),
+                        "left_grip": round(float(controller_data[1]), 4),
+                        "right_trigger": round(float(controller_data[2]), 4),
+                        "right_grip": round(float(controller_data[3]), 4),
+                    }
+
+                scaled_left_cmd = [int(np.clip(val * 1000, Inspire_FTP_Controller_Close_Cmd, Inspire_FTP_Controller_Open_Cmd)) for val in left_q_target]
+                scaled_right_cmd = [int(np.clip(val * 1000, Inspire_FTP_Controller_Close_Cmd, Inspire_FTP_Controller_Open_Cmd)) for val in right_q_target]
 
                 # get dual hand action
                 action_data = np.concatenate((left_q_target, right_q_target))
@@ -322,7 +367,34 @@ class Inspire_Controller_FTP:
                         dual_hand_state_array[:] = state_data
                         dual_hand_action_array[:] = action_data
 
-                self._send_hand_command(scaled_left_cmd, scaled_right_cmd)
+                publish_result = self._send_hand_command(scaled_left_cmd, scaled_right_cmd)
+                if start_time - last_debug_log_time >= 1.0:
+                    state_received = None
+                    if hand_state_received_array is not None:
+                        with hand_state_received_array.get_lock():
+                            state_received = {
+                                "left": bool(hand_state_received_array[0]),
+                                "right": bool(hand_state_received_array[1]),
+                            }
+                    logger_mp.info(
+                        "[Inspire_Controller_FTP DEBUG] "
+                        f"controller={controller_debug} "
+                        f"left_close={left_close} "
+                        f"right_close={right_close} "
+                        f"mapping=official_range_200_800_invert_channels_4_5 "
+                        f"left_target_cmd={np.round(left_cmd_target, 2).tolist()} "
+                        f"right_target_cmd={np.round(right_cmd_target, 2).tolist()} "
+                        f"left_smoothed_cmd={np.round(left_cmd_smoothed, 2).tolist()} "
+                        f"right_smoothed_cmd={np.round(right_cmd_smoothed, 2).tolist()} "
+                        f"dual_hand_action={np.round(action_data, 4).tolist()} "
+                        f"left_cmd={scaled_left_cmd} "
+                        f"right_cmd={scaled_right_cmd} "
+                        f"publish_called=True "
+                        f"publish_result={publish_result} "
+                        f"state_topics={{'left': '{kTopicInspireFTPLeftState}', 'right': '{kTopicInspireFTPRightState}'}} "
+                        f"state_received={state_received}"
+                    )
+                    last_debug_log_time = start_time
                 current_time = time.time()
                 time_elapsed = current_time - start_time
                 sleep_time = max(0, (1 / self.fps) - time_elapsed)
